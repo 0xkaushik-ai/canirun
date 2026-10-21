@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from . import __version__, estimate as est, hardware, models, presets
+from . import __version__, bench, estimate as est, hardware, models, presets
 from .hardware import GiB, Hardware, Memory
 from .quants import KV_BYTES, quants_for
 
@@ -31,7 +31,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         prog="canirun",
         description="Can your machine run that LLM? Memory, best quant, and tokens/sec.",
     )
-    p.add_argument("model", nargs="?", help="alias (llama3-8b), HF repo id (org/name), or path to config.json")
+    p.add_argument("model", nargs="?",
+                   help="alias (llama3-8b), HF repo id (org/name), file.gguf, ollama:<model>, or config.json")
     p.add_argument("--ctx", type=int, default=8192, help="context length in tokens (default 8192)")
     p.add_argument("--kv-quant", choices=list(KV_BYTES), default="f16", help="KV cache type (llama.cpp -ctk/-ctv)")
     what_if = p.add_argument_group("what-if (override detected hardware)")
@@ -43,6 +44,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     what_if.add_argument("--cpu-only", action="store_true", help="ignore the GPU")
     p.add_argument("--rebench", action="store_true", help="re-measure RAM bandwidth instead of using the cache")
     p.add_argument("--refresh", action="store_true", help="re-fetch the model config instead of using the cache")
+    b = p.add_argument_group("benchmark (needs a .gguf file or ollama:<model>)")
+    b.add_argument("--benchmark", action="store_true", help="run it for real and compare with the prediction")
+    b.add_argument("--ngl", type=int, help="GPU layers to benchmark with (default: canirun's prediction)")
+    b.add_argument("--llama-bench", metavar="PATH", help="llama-bench binary (default: $LLAMA_BENCH or PATH)")
+    b.add_argument("--share", action="store_true", help="open a pre-filled GitHub issue with the result")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.add_argument("--list-models", action="store_true", help="show built-in model aliases")
     p.add_argument("--list-gpus", action="store_true", help="show GPU / Mac presets for --gpu")
@@ -52,6 +58,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         p.error("which model? e.g. `canirun llama3-8b`")
     if args.ctx <= 0:
         p.error("--ctx must be positive")
+    if args.benchmark and any((args.gpu, args.vram, args.gpu_bw, args.ram, args.ram_bw)):
+        p.error("--benchmark measures this machine; drop the what-if flags")
     return args
 
 
@@ -150,7 +158,9 @@ def render(spec: models.ModelSpec, hw: Hardware, ests: list[est.Estimate], best,
     t.add_column("")
     for e in ests:
         speed = f"~{e.tok_s:.0f} tok/s" if e.tok_s and e.tok_s >= 1 else (f"~{e.tok_s:.1f} tok/s" if e.tok_s else "—")
-        mark = Text("← recommended", style="bold cyan") if e is best else Text("")
+        yours = bool(spec.file_quant) and e.quant.name == spec.file_quant
+        mark = Text("← recommended" + (" (your file)" if yours else ""), style="bold cyan") if e is best \
+            else Text("← your file" if yours else "", style="dim")
         style = "bold" if e is best else ("dim" if not e.fits else "")
         t.add_row(Text(e.quant.name, style=style), _gb(e.total_bytes), _fit_cell(e, hw), speed, e.quant.quality, mark)
     console.print()
@@ -214,6 +224,54 @@ def _list_gpus() -> None:
     console.print("[dim]Mac chips use their base memory; set yours with --ram.[/]")
 
 
+def run_benchmark(spec: models.ModelSpec, hw: Hardware, args: argparse.Namespace) -> int:
+    status = console.status("Freeing the GPU…", spinner="dots") if not args.json else _null()
+    with status:
+        if args.model.lower().startswith("ollama:"):
+            # Models Ollama still holds would make free VRAM look smaller than it is.
+            from . import ollama
+            ollama.unload_all()
+            hw.gpu = hardware.detect_nvidia() or hw.gpu
+        def progress(msg):
+            if not args.json:
+                status.update(msg)
+        try:
+            result = bench.run(spec, hw, args.model, hw.cpu_name, args.ngl, args.llama_bench, progress)
+        except models.ModelError as e:
+            err_console.print(f"[red]error:[/] {e}")
+            return 1
+    saved = bench.save(result)
+    url = bench.share_url(result)
+
+    if args.json:
+        print(json.dumps({**asdict(result), "error_pct": round(result.error_pct, 1), "saved": str(saved)}, indent=2))
+    else:
+        console.print()
+        console.print(f"[bold]{result.model}[/] [dim]{result.quant} · {result.file_gb} GB · "
+                      f"{result.gpu_layers}/{result.n_layers} layers on GPU · {result.backend_version}[/]")
+        t = Table(box=None, pad_edge=False, padding=(0, 2), header_style="bold dim")
+        t.add_column("")
+        t.add_column("predicted", justify="right")
+        t.add_column("measured", justify="right")
+        t.add_column("error", justify="right")
+        err = result.error_pct
+        style = "green" if abs(err) <= 15 else "yellow" if abs(err) <= 30 else "red"
+        t.add_row("decode", f"{result.predicted_tok_s:.1f} tok/s", f"{result.measured_tok_s:.1f} tok/s",
+                  Text(f"{err:+.0f}%", style=style))
+        if result.prompt_tok_s:
+            t.add_row("prompt", "[dim]—[/]", f"{result.prompt_tok_s:,.0f} tok/s", "")
+        console.print(t)
+        for note in result.notes:
+            console.print(f"[yellow]! {note}[/]")
+        console.print(f"\n[dim]Saved {saved}[/]")
+        console.print(f"Help calibrate canirun: [link={url}]share this result as a GitHub issue[/link]"
+                      + ("" if args.share else " [dim](or rerun with --share)[/]"))
+    if args.share:
+        import webbrowser
+        webbrowser.open(url)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.list_models:
@@ -231,7 +289,12 @@ def main(argv: list[str] | None = None) -> int:
         err_console.print(f"[red]error:[/] {e}")
         return 1
 
-    ests = est.estimate_all(spec, hw, args.ctx, KV_BYTES[args.kv_quant], quants_for(spec.native_quant))
+    if args.benchmark:
+        return run_benchmark(spec, hw, args)
+
+    file_bpw = spec.file_bytes * 8 / spec.total_params if spec.file_bytes else 0.0
+    quants = quants_for(spec.native_quant, spec.file_quant, file_bpw)
+    ests = est.estimate_all(spec, hw, args.ctx, KV_BYTES[args.kv_quant], quants)
     best = est.recommend(ests)
     if args.json:
         print(_to_json(spec, hw, ests, best, args))

@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 MODEL_CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "canirun" / "models"
-CACHE_VERSION = 2  # bump when ModelSpec or the parsing changes
+CACHE_VERSION = 3  # bump when ModelSpec or the parsing changes
 
 # Short names -> ungated HF repos with the same architecture as the original.
 ALIASES: dict[str, str] = {
@@ -86,6 +86,8 @@ class ModelSpec:
     experts_per_token: int = 0
     param_source: str = "config"
     native_quant: str = ""      # e.g. "mxfp4" for gpt-oss
+    file_quant: str = ""        # set when loaded from a specific GGUF file
+    file_bytes: int = 0
 
     @property
     def is_moe(self) -> bool:
@@ -132,7 +134,7 @@ def _attention_layout(cfg: dict, n_layers: int) -> tuple[int, int, int]:
     if not window or cfg.get("use_sliding_window") is False:
         return n_layers, 0, 0
 
-    if model_type.startswith("gemma2"):
+    if model_type.startswith(("gemma2", "gpt-oss", "gpt_oss")):  # alternating local/global
         swa = n_layers // 2
     elif model_type.startswith("gemma3"):
         pattern = cfg.get("sliding_window_pattern") or 6
@@ -252,6 +254,8 @@ def spec_from_config(cfg: dict, name: str, exact_params: int | None = None) -> M
 def resolve(name: str) -> str:
     """Map a short alias to a repo id; pass repo ids and paths through."""
     key = name.lower().strip()
+    if key.startswith("ollama:"):
+        return name
     if key in ALIASES:
         return ALIASES[key]
     if "/" in name or Path(name).exists():
@@ -283,7 +287,13 @@ def _cache_path(repo: str) -> Path:
 
 def load(name: str, refresh: bool = False) -> ModelSpec:
     target = resolve(name)
+    if target.lower().startswith("ollama:"):
+        from . import ollama
+        return ollama.load(target[len("ollama:"):])
     path = Path(target)
+    if path.is_file() and path.suffix.lower() == ".gguf":
+        from . import gguf
+        return gguf.load_file(path)
     if path.exists():
         cfg_path = path / "config.json" if path.is_dir() else path
         return spec_from_config(json.loads(cfg_path.read_text()), path.stem if path.is_file() else path.name)

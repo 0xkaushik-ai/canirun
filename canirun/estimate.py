@@ -14,12 +14,19 @@ from .quants import QUANTS, Quant
 
 GiB = 1024**3
 
-# Fraction of theoretical bandwidth llama.cpp reaches during decode.
-# Starting points from public benchmarks; v0.2 calibrates them with --benchmark.
-EFFICIENCY = {"cuda": 0.70, "metal": 0.70, "cpu": 0.75}
+# Fraction of bandwidth llama.cpp reaches during decode, fitted to --benchmark
+# runs with scripts/calibrate.py (RTX 3050 Laptop + i7-11800H, Ollama and
+# llama-bench; dense models). "cpu" is relative to canirun's own RAM
+# measurement, which reads ~89% of spec, so spec-sheet bandwidths use
+# CPU_SPEC_EFFICIENCY. Metal is not calibrated yet.
+EFFICIENCY = {"cuda": 0.88, "metal": 0.70, "cpu": 0.95}
+CPU_SPEC_EFFICIENCY = 0.85
+# Fixed cost per layer per token (kernel launches, thread sync). Invisible on
+# big models, but it's what caps tiny models well below the bandwidth ceiling.
+LAYER_OVERHEAD_S = {"cuda": 45e-6, "metal": 0.0, "cpu": 0.0}
 # MoE decode reaches less of it: routing plus many small expert matmuls.
-# Uncalibrated guess from public Qwen3-30B-A3B / gpt-oss runs.
-MOE_EFFICIENCY = 0.6
+# Not measured yet; set from public Qwen3-30B-A3B / gpt-oss runs on a 4090.
+MOE_EFFICIENCY = 0.8
 
 RUNTIME_OVERHEAD = 0.5 * GiB    # CUDA/Metal context, allocator slack
 UBATCH = 512                    # llama.cpp default micro-batch for prompt processing
@@ -78,28 +85,56 @@ def _split_weights(spec: ModelSpec, params: int, bpw: float) -> tuple[float, flo
     return layers, head * n_embed_tensors
 
 
+def bytes_per_token(spec: ModelSpec, quant: Quant, gpu_layers: int, kv_tokens: int,
+                    kv_bytes_per_elem: float = 2.0) -> tuple[float, float]:
+    """(GPU bytes, CPU bytes) streamed per generated token.
+
+    Like llama.cpp's -ngl, the output head only moves to the GPU once every
+    layer is there. The input embedding is a single-row lookup, but the output
+    head reads its whole matrix. `kv_tokens` is how full the KV cache is.
+    """
+    bpw = quant.bytes_per_weight
+    layer_read, _ = _split_weights(spec, spec.active_params, bpw)
+    head_read = spec.embed_params * bpw
+    kv_read = kv_cache_bytes(spec, max(kv_tokens, 1), kv_bytes_per_elem)
+
+    n = spec.n_layers
+    g = min(max(gpu_layers, 0), n)
+    frac = g / n
+    gpu_read = frac * (layer_read + kv_read) + (head_read if g == n else 0)
+    cpu_read = (1 - frac) * (layer_read + kv_read) + (0 if g == n else head_read)
+    return gpu_read, cpu_read
+
+
+def decode_speed(spec: ModelSpec, hw: Hardware, quant: Quant, gpu_layers: int, kv_tokens: int,
+                 kv_bytes_per_elem: float = 2.0) -> float:
+    """Decode tok/s with `gpu_layers` of the model's layers on the GPU."""
+    g = min(max(gpu_layers, 0), spec.n_layers) if hw.gpu else 0
+    gpu_read, cpu_read = bytes_per_token(spec, quant, g, kv_tokens, kv_bytes_per_elem)
+
+    t = 0.0
+    if gpu_read:
+        t += gpu_read / (hw.gpu.bandwidth_gbs * 1e9 * EFFICIENCY[hw.gpu.kind])
+        t += g * LAYER_OVERHEAD_S[hw.gpu.kind]
+    if cpu_read:
+        cpu_eff = EFFICIENCY["cpu"] if hw.ram.bandwidth_source == "measured" else CPU_SPEC_EFFICIENCY
+        t += cpu_read / (hw.ram.bandwidth_gbs * 1e9 * cpu_eff)
+        t += (spec.n_layers - g) * LAYER_OVERHEAD_S["cpu"]
+    if not t:
+        return 0.0
+    return (MOE_EFFICIENCY if spec.is_moe else 1.0) / t
+
+
 def estimate(spec: ModelSpec, hw: Hardware, quant: Quant, ctx: int, kv_bytes_per_elem: float = 2.0) -> Estimate:
     bpw = quant.bytes_per_weight
     weights = spec.total_params * bpw
     kv = kv_cache_bytes(spec, ctx, kv_bytes_per_elem)
     overhead = overhead_bytes(spec)
     total = weights + kv + overhead
+    speed_tokens = int(ctx * SPEED_CTX_FRACTION)
 
-    # Bytes streamed per generated token. The input embedding is a single-row
-    # lookup, but the output head reads its whole matrix.
-    layer_read, _ = _split_weights(spec, spec.active_params, bpw)
-    head_read = spec.embed_params * bpw
-    kv_read = kv_cache_bytes(spec, max(int(ctx * SPEED_CTX_FRACTION), 1), kv_bytes_per_elem)
-
-    def tok_s(gpu_read: float, cpu_read: float) -> float:
-        t = 0.0
-        if gpu_read:
-            t += gpu_read / (hw.gpu.bandwidth_gbs * 1e9 * EFFICIENCY[hw.gpu.kind])
-        if cpu_read:
-            t += cpu_read / (hw.ram.bandwidth_gbs * 1e9 * EFFICIENCY["cpu"])
-        if not t:
-            return 0.0
-        return (MOE_EFFICIENCY if spec.is_moe else 1.0) / t
+    def tok_s(gpu_layers: int) -> float:
+        return decode_speed(spec, hw, quant, gpu_layers, speed_tokens, kv_bytes_per_elem)
 
     n = spec.n_layers
     base = dict(quant=quant, weights_bytes=weights, kv_bytes=kv, overhead_bytes=overhead, n_layers=n)
@@ -107,8 +142,7 @@ def estimate(spec: ModelSpec, hw: Hardware, quant: Quant, ctx: int, kv_bytes_per
 
     # 1. Everything on the GPU.
     if gpu and total <= gpu.usable_bytes:
-        return Estimate(**base, placement="gpu", gpu_layers=n,
-                        tok_s=tok_s(layer_read + head_read + kv_read, 0), gpu_bytes=total)
+        return Estimate(**base, placement="gpu", gpu_layers=n, tok_s=tok_s(n), gpu_bytes=total)
 
     # 2. Split: as many layers as fit on the GPU, the rest (and the
     #    embedding/output head) in system RAM. Not possible with unified memory.
@@ -119,18 +153,12 @@ def estimate(spec: ModelSpec, hw: Hardware, quant: Quant, ctx: int, kv_bytes_per
         g = max(0, min(n - 1, int(budget // per_layer))) if budget > 0 else 0
         cpu_need = (n - g) * per_layer + head_store
         if g > 0 and cpu_need <= hw.ram.usable_bytes:
-            frac = g / n
-            speed = tok_s(
-                frac * (layer_read + kv_read),
-                (1 - frac) * (layer_read + kv_read) + head_read,
-            )
-            return Estimate(**base, placement="split", gpu_layers=g, tok_s=speed,
+            return Estimate(**base, placement="split", gpu_layers=g, tok_s=tok_s(g),
                             gpu_bytes=g * per_layer + overhead, cpu_bytes=cpu_need)
 
     # 3. CPU only (on unified memory the GPU limit above is the whole story).
     if not hw.unified and total <= hw.ram.usable_bytes:
-        return Estimate(**base, placement="cpu", gpu_layers=0,
-                        tok_s=tok_s(0, layer_read + head_read + kv_read), cpu_bytes=total)
+        return Estimate(**base, placement="cpu", gpu_layers=0, tok_s=tok_s(0), cpu_bytes=total)
 
     return Estimate(**base, placement="none", gpu_layers=0, tok_s=None)
 

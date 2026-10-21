@@ -39,8 +39,25 @@ NATIVE_QUANTS = {
 }
 
 
-def quants_for(native_quant: str) -> list[Quant]:
-    return NATIVE_QUANTS.get(native_quant, QUANTS)
+# Labels for formats a GGUF file may use that aren't in the table above.
+OTHER_QUALITY = {
+    "bf16": "lossless", "f32": "lossless", "q5_k_s": "very good", "q5_0": "very good",
+    "q4_k_s": "good", "q4_0": "good", "q4_1": "good", "iq4_xs": "good", "iq4_nl": "good",
+    "mxfp4": "native", "q3_k_l": "lossy", "q3_k_s": "lossy", "iq3_m": "lossy", "iq3_s": "lossy",
+    "iq3_xs": "lossy", "iq3_xxs": "lossy",
+}
+
+
+def quants_for(native_quant: str, file_quant: str = "", file_bpw: float = 0.0) -> list[Quant]:
+    """Quants to show. A specific GGUF file replaces its row with its exact size."""
+    quants = NATIVE_QUANTS.get(native_quant, QUANTS)
+    if not (file_quant and file_bpw):
+        return quants
+    known = QUANTS_BY_NAME.get(file_quant.lower())
+    quality = known.quality if known else OTHER_QUALITY.get(file_quant.lower(), "very lossy")
+    mine = Quant(file_quant, file_bpw, quality)
+    rest = [q for q in quants if q.name.lower() != file_quant.lower()]
+    return sorted([*rest, mine], key=lambda q: -q.bits_per_weight)
 
 # Bytes per element of the KV cache (llama.cpp --cache-type-k/v).
 # q8_0 and q4_0 store one fp16 scale per block of 32 values.
